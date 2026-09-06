@@ -1,16 +1,17 @@
-import gc
-import logging
-import math
 import os
-import comfy.cli_args
-import comfy.model_management as mm
-import comfy.model_patcher
-import comfy.sd
-import folder_paths
-from server import PromptServer
+import math
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import folder_paths
+import comfy.sd
+import comfy.model_patcher
+import comfy.model_management as mm
+
+from server import PromptServer
+from comfy.ldm.minimax.vae import EncoderFCN3D
 
 try:
   import tensorrt as trt
@@ -126,6 +127,75 @@ class AutoEngineRunner:
     self.stream.synchronize()
     return output
 
+class PyTorchEncoderRunner:
+  
+  def __init__(self, model_path: str):
+    self.model_path = model_path
+    self.state_dict = None
+    self.model = None
+    
+  @property
+  def context(self):
+    return self.model
+  
+  def load_to_ram(self):
+    if self.state_dict is None:
+      self.state_dict = comfy.utils.load_torch_file(self.model_path, safe_load=True)
+      
+  def load_to_gpu(self):
+    if self.model is not None:
+      return
+    self.load_to_ram()
+    
+    encoder = EncoderFCN3D(
+        ch=128,
+        ch_mult=(1, 2, 2, 4, 4, 8),
+        space_down=(2, 2, 2, 2, 1, 1),
+        time_down=(1, 2, 2, 1, 1, 1),
+        num_res_blocks=2,
+        in_channels=3,
+        z_channels=24,
+    )
+    quant_conv = nn.Conv3d(48, 48, 1)
+    
+    # 载入 300MB 提取的权重
+    enc_weights = {
+        k.replace("encoder.", ""): v
+        for k, v in self.state_dict.items()
+        if k.startswith("encoder.")
+    }
+    qconv_weights = {
+        k.replace("quant_conv.", ""): v
+        for k, v in self.state_dict.items()
+        if k.startswith("quant_conv.")
+    }
+    
+    encoder.load_state_dict(enc_weights, strict=False)
+    quant_conv.load_state_dict(qconv_weights, strict=False)
+    
+    class CombinedEncoder(nn.Module):
+      
+      def __init__(self, enc, qconv):
+        super().__init__()
+        self.encoder = enc
+        self.quant_conv = qconv
+        
+      def forward(self, x):
+        return self.quant_conv(self.encoder(x))
+      
+    self.model = CombinedEncoder(encoder, quant_conv).cuda().half().eval()
+    
+  def offload_to_ram(self):
+    if self.model is not None:
+      self.model = None
+      torch.cuda.empty_cache()
+      
+  def infer(
+      self, input_tensor: torch.Tensor, output_shape: tuple, input_name: str
+  ) -> torch.Tensor:
+    self.load_to_gpu()
+    with torch.no_grad():
+      return self.model(input_tensor.half().cuda())
 
 # ================= 3. MiniMax-H3 加速 VAE 实现 =================
 
@@ -321,34 +391,37 @@ class MiniMaxH3TRTVAE(nn.Module):
 
   def _encode_moments(self, x):
     b, c, t, h, w = x.shape
+    is_trt = isinstance(self.encoder_runner, AutoEngineRunner)
+    
+    # 🌟 1. 原生 PyTorch 编码器：动态尺寸直接前向计算，不强行 Padding 填充
+    if not is_trt:
+      out_shape = (b, 48, math.ceil(t / self.vae_ratio_t), h // self.vae_ratio, w // self.vae_ratio)
+      return self.encoder_runner.infer(x, output_shape=out_shape, input_name="pixel_tile")
+    
+    # 🌟 2. 静态 TensorRT 引擎：自动补齐到标准的 [1, 3, 17, 256, 256]
     target_h, target_w = self.tile_size, self.tile_size
+    target_t = self.clip_length
+    
     pad_h = max(0, target_h - h)
     pad_w = max(0, target_w - w)
-
-    if pad_h > 0 or pad_w > 0:
-      x_in = F.pad(x, (0, pad_w, 0, pad_h, 0, 0), mode="constant", value=0.0)
+    pad_t = max(0, target_t - t)
+    
+    if pad_h > 0 or pad_w > 0 or pad_t > 0:
+      x_in = F.pad(x, (0, pad_w, 0, pad_h, pad_t, 0), mode="constant", value=0.0)
     else:
       x_in = x
-
+      
     out_shape = (
-        b,
-        48,
-        math.ceil(t / self.vae_ratio_t),
-        target_h // self.vae_ratio,
-        target_w // self.vae_ratio,
+        b, 48, math.ceil(target_t / self.vae_ratio_t), 
+        target_h // self.vae_ratio, target_w // self.vae_ratio,
     )
-    moments = self.encoder_runner.infer(
-        x_in, output_shape=out_shape, input_name="pixel_tile"
-    )
-
+    moments = self.encoder_runner.infer(x_in, output_shape=out_shape, input_name="pixel_tile")
     out_h = math.ceil(h / self.vae_ratio)
     out_w = math.ceil(w / self.vae_ratio)
     return moments[..., :out_h, :out_w]
 
   def _finalize_pixels(self, part):
-    return (part * self.pixel_std.to(part) + self.pixel_mean.to(part)).clamp(
-        0.0, 1.0
-    )
+    return (part * self.pixel_std.to(part) + self.pixel_mean.to(part)).clamp(0.0, 1.0)
 
   def _normalize_pixels(self, x):
     return (x - self.pixel_mean.to(x)) / self.pixel_std.to(x)
@@ -358,10 +431,7 @@ class MiniMaxH3TRTVAE(nn.Module):
     if blend_extent <= 0:
       return b
 
-    weight = (
-        torch.arange(blend_extent, device=b.device, dtype=b.dtype)
-        / blend_extent
-    )
+    weight = (torch.arange(blend_extent, device=b.device, dtype=b.dtype) / blend_extent)
     shape = [1] * a.ndim
     shape[dim] = blend_extent
     weight = weight.view(shape)
@@ -540,15 +610,28 @@ class MiniMaxH3TRTVAE(nn.Module):
 
   def encode(self, x):
     if self.encoder_runner is None:
-      raise RuntimeError("Encoder engine is not configured in VAE Loader node!")
+      raise RuntimeError("Encoder engine/weight is not configured in VAE Loader node!")
     if x.ndim == 4:
-      x = x.unsqueeze(2)  # 扩展为 5D 张量 [B, C, 1, H, W]
-    # 🌟 修复关键：当输入是单张图片 (T=1) 时，在时间维度复制填满 17 帧以满足静态 TRT 引擎
+      x = x.unsqueeze(2)  # [B, C, 1, H, W]
+      
+    is_trt = isinstance(self.encoder_runner, AutoEngineRunner)
+    
+    # 🌟 单张图片 (T=1)：
     if x.shape[2] == 1:
-      x_static = x.repeat(1, 1, self.clip_length, 1, 1)
-      moments = self.tiled_encode(self._normalize_pixels(x_static))[:, :, -1:, :, :]
+      if not is_trt:
+        # 原生 PyTorch 编码器：单帧直接送入
+        moments = self.tiled_encode(self._normalize_pixels(x))[:, :, -1:, :, :]
+      else:
+        # 🌟 TensorRT 引擎满血解法：第 1 帧放原图，后方补 16 帧 0，利用因果卷积提取纯净的第 0 帧
+        # 5D 张量 Padding: (W_left, W_right, H_top, H_bottom, T_front, T_back)
+        x_norm = self._normalize_pixels(x)
+        x_static = F.pad(x_norm, (0, 0, 0, 0, 0, self.clip_length - 1), mode="constant", value=0.0)
+        # 🌟 关键：取第一帧特征 [:1]，绝不取最后一帧！
+        moments = self.tiled_encode(x_static)[:, :, :1, :, :]
     else:
+      # 视频 (T>1)：正常时空分块
       moments = self.encode_temporal(x)
+      
     mean = torch.chunk(moments, 2, dim=1)[0]
     return (mean - self.latents_mean.to(mean)) / self.latents_std.to(mean)
 
@@ -718,7 +801,7 @@ class MiniMaxH3TRTVAELoader:
     for path in folder_paths.get_folder_paths("vae"):
       for root, _, fs in os.walk(path):
         for f in fs:
-          if f.endswith(".engine"):
+          if f.endswith((".engine", ".sft")):
             files.append(os.path.relpath(os.path.join(root, f), path))
     files = sorted(list(dict.fromkeys(files)))
     options = ["None"] + files
@@ -751,19 +834,17 @@ class MiniMaxH3TRTVAELoader:
     if decoder == "None" and encoder == "None":
       raise RuntimeError("At least one of Decoder or Encoder must be selected in TRT VAE Loader!")
 
-    dec_path = (
-        folder_paths.get_full_path("vae", decoder)
-        if decoder != "None"
-        else None
-    )
-    enc_path = (
-        folder_paths.get_full_path("vae", encoder)
-        if encoder != "None"
-        else None
-    )
-
+    dec_path = folder_paths.get_full_path("vae", decoder) if decoder != "None" else None
+    enc_path = folder_paths.get_full_path("vae", encoder) if encoder != "None" else None
     dec_runner = AutoEngineRunner(dec_path) if dec_path else None
-    enc_runner = AutoEngineRunner(enc_path) if enc_path else None
+    
+    if enc_path:
+      if enc_path.endswith(".sft"):
+        enc_runner = PyTorchEncoderRunner(enc_path)
+      else:
+        enc_runner = AutoEngineRunner(enc_path)
+    else:
+      enc_runner = None
 
     vae_instance = MiniMaxH3TRTVAE(decoder_runner=dec_runner, encoder_runner=enc_runner)
     return (ComfyTRTVAE(vae_instance),)
