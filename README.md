@@ -24,7 +24,9 @@ python -m pip install -r ComfyUI-H3VAE_TRT/requirements.txt
 
 ### Nodes
 - Compile the TensorRT engine from onnx using the `MiniMax-H3 TRT VAE Compiler` node before first use.  
-- After compiling the TRT Engines, you can use the `MiniMax-H3 TRT VAE Loader` node to load them.  
+- After compiling the TRT Engines, you can use the `MiniMax-H3 TRT VAE Loader` node to load them.    
+
+	> If you need to compile outside of ComfyUI, use the `compile.py` script in the project.
 
 ## Credits
 - [ComfyUI](https://github.com/comfyanonymous/ComfyUI) @comfyanonymous

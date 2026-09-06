@@ -29,7 +29,9 @@ python -m pip install -r ComfyUI-H3VAE_TRT/requirements.txt
 ### 节点
 
 - 首次使用前请先通过 `MiniMax-H3 TRT Compiler` 节点将 ONNX 模型编译为 TensorRT 引擎。
-- 成功编译 TRT Engine 后，就可以使用 `MiniMax-H3 TRT VAE Loader` 节点加载它们了。
+- 成功编译 TRT Engine 后，就可以使用 `MiniMax-H3 TRT VAE Loader` 节点加载它们了。  
+
+	> 如果需要在 ComfyUI 之外进行编译, 可以使用项目目录中的`compile.py`脚本
 
 ## 致谢
 
